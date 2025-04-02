@@ -20,7 +20,7 @@ use bullet_lib::{
     },
 };
 
-const HIDDEN_SIZE: usize = 128;
+const HIDDEN_SIZE: usize = 64;
 const SCALE: i32 = 400;
 const QA: i16 = 255;
 const QB: i16 = 64;
@@ -72,7 +72,13 @@ fn main() {
     };
 
     // loading directly from a `BulletFormat` file
-    let data_loader = loader::DirectSequentialDataLoader::new(&["data/baseline.data"]);
+    let data_loader = {
+        use bullet_lib::default::loader::ViriBinpackLoader;
+        let file_path = "data/data.binpack";
+        let buffer_size_mb = 1024;
+        let threads = 4;
+        ViriBinpackLoader::new(file_path, buffer_size_mb, threads, Default::default())
+    };
 
     trainer.run(&schedule, &settings, &data_loader);
 }
