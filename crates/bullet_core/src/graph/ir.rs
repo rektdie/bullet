@@ -28,9 +28,7 @@ pub struct GraphIR {
 
 #[derive(Debug, PartialEq)]
 pub enum GraphIRCompileError {
-    RootIsAnInput,
-    RootIsAWeight,
-    RootIsNonScalar,
+    InvalidRootNode,
     FailedToInitTensor,
 }
 
@@ -163,16 +161,8 @@ impl GraphIR {
         let root = self.root()?.idx;
         let root_data = self.get(root).unwrap();
 
-        if !root_data.requires_grad {
-            return Err(GraphIRError::Compilation(GraphIRCompileError::RootIsAnInput));
-        }
-
-        if self.weights.contains(&root) {
-            return Err(GraphIRError::Compilation(GraphIRCompileError::RootIsAWeight));
-        }
-
-        if root_data.shape != Shape::new(1, 1) {
-            return Err(GraphIRError::Compilation(GraphIRCompileError::RootIsNonScalar));
+        if !root_data.requires_grad || root_data.batched || root_data.shape != Shape::new(1, 1) {
+            return Err(GraphIRError::Compilation(GraphIRCompileError::InvalidRootNode));
         }
 
         let device = Arc::new(device);
@@ -180,7 +170,7 @@ impl GraphIR {
         let mut nodes = Vec::new();
         for node_data in &self.nodes {
             if let Some(GraphIRNode { shape, requires_grad, parent_operation, idx, sparse, .. }) = node_data.clone() {
-                let tensor = Tensor::new(device.clone(), shape.size(), requires_grad, parent_operation, sparse, idx);
+                let tensor = Tensor::new(device.clone(), shape, requires_grad, parent_operation, sparse, idx);
                 let tensor = tensor.map_err(|_| GraphIRError::Compilation(GraphIRCompileError::FailedToInitTensor));
 
                 nodes.push(Some(RefCell::new(tensor?)));
@@ -229,7 +219,7 @@ impl GraphIR {
     }
 
     fn try_fusion_pass(&mut self) -> Result<bool, GraphIRError> {
-        for node in (0..self.nodes.len()).rev() {
+        for node in 0..self.nodes.len() {
             if self.get(node).is_ok() {
                 if let Some(mut desc) = fusion::search_for_fusion(self, node)? {
                     desc.eliminated.push(node);

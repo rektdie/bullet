@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    ops::{Add, Div, Mul, Sub},
+    ops::{Add, Div, Mul, Neg, Sub},
     sync::{Mutex, MutexGuard},
 };
 
@@ -10,7 +10,7 @@ use super::{
     ir::{
         args::GraphIRCompileArgs,
         node::AnnotatedNode,
-        op::{DiffableFromOutput, GraphIROp, UnaryOp},
+        op::{DiffableFromOutput, GraphIROp, Reduce, UnaryOp},
         GraphIR,
     },
     Graph, Node,
@@ -40,6 +40,7 @@ pub enum InitSettings {
 pub struct GraphBuilder {
     graph_builder: Mutex<GraphIR>,
     init_data: Mutex<HashMap<String, InitSettings>>,
+    consts: Mutex<HashMap<usize, Vec<f32>>>,
     args: GraphIRCompileArgs,
 }
 
@@ -72,6 +73,13 @@ impl GraphBuilder {
         GraphBuilderNode { node, builder: self }
     }
 
+    pub fn new_constant<'a>(&'a self, shape: Shape, vals: &[f32]) -> GraphBuilderNode<'a> {
+        let node = self.builder().add_node(None, None, shape, false, false, None).unwrap();
+        assert_eq!(shape.size(), vals.len(), "Shape of constant does not match provided values!");
+        self.consts.try_lock().unwrap().insert(node.idx, vals.to_vec());
+        GraphBuilderNode { node, builder: self }
+    }
+
     pub fn new_weights<'a>(&'a self, id: &str, shape: Shape, init: InitSettings) -> GraphBuilderNode<'a> {
         let node = self.builder().add_weights(id, shape).unwrap();
         self.init().insert(id.to_string(), init);
@@ -84,7 +92,7 @@ impl GraphBuilder {
 
     pub fn new_affine_custom(&self, id: &str, input_size: usize, output_size: usize, bias_cols: usize) -> Affine {
         let wid = format!("{}w", id);
-        let init = InitSettings::Normal { mean: 0.0, stdev: 1.0 / (input_size as f32 * bias_cols as f32).sqrt() };
+        let init = InitSettings::Normal { mean: 0.0, stdev: (2.0 / (input_size as f32 * bias_cols as f32)).sqrt() };
         let weights = self.new_weights(&wid, Shape::new(output_size, input_size), init);
         let bias = self.new_weights(&format!("{}b", id), Shape::new(output_size, bias_cols), InitSettings::Zeroed);
 
@@ -97,7 +105,12 @@ impl GraphBuilder {
 
     pub fn build<D: Device>(self, device: D) -> Graph<D> {
         let mut builder = self.graph_builder.into_inner().unwrap();
-        builder.add_op(GraphIROp::ReduceAcrossBatch(builder.root().unwrap())).unwrap();
+        let root = builder.root().unwrap();
+
+        if builder.get(root.idx).unwrap().batched {
+            builder.add_op(GraphIROp::ReduceAcrossBatch(root, Reduce::Sum)).unwrap();
+        }
+
         let mut graph = builder.compile(device, self.args).unwrap();
 
         for (id, init_data) in self.init_data.lock().unwrap().iter() {
@@ -110,6 +123,10 @@ impl GraphBuilder {
                     graph.get_weights_mut(id).seed_random(mean, stdev, false).unwrap()
                 }
             };
+        }
+
+        for (&idx, vals) in self.consts.lock().unwrap().iter() {
+            graph.get_mut(idx).unwrap().load_dense_from_slice(None, vals).unwrap();
         }
 
         graph
@@ -154,6 +171,14 @@ impl Add<f32> for GraphBuilderNode<'_> {
     }
 }
 
+impl Neg for GraphBuilderNode<'_> {
+    type Output = Self;
+
+    fn neg(self) -> Self::Output {
+        -1.0 * self
+    }
+}
+
 impl<'a> Sub<GraphBuilderNode<'a>> for f32 {
     type Output = GraphBuilderNode<'a>;
 
@@ -175,6 +200,14 @@ impl<'a> Mul<GraphBuilderNode<'a>> for f32 {
 
     fn mul(self, rhs: GraphBuilderNode<'a>) -> Self::Output {
         rhs.builder.apply(GraphIROp::Unary(rhs.node, UnaryOp::Mul(self)))
+    }
+}
+
+impl<'a> Mul<GraphBuilderNode<'a>> for GraphBuilderNode<'a> {
+    type Output = GraphBuilderNode<'a>;
+
+    fn mul(self, rhs: GraphBuilderNode<'a>) -> Self::Output {
+        self.concat(rhs).pairwise_mul()
     }
 }
 
@@ -248,13 +281,35 @@ impl GraphBuilderNode<'_> {
         self.builder.apply(GraphIROp::Concat(self.node, rhs.node))
     }
 
+    pub fn copy_stop_grad(self) -> Self {
+        self.builder.apply(GraphIROp::Copy(self.node, true))
+    }
+
+    pub fn copy(self) -> Self {
+        self.builder.apply(GraphIROp::Copy(self.node, false))
+    }
+
     pub fn linear_comb(self, alpha: f32, rhs: Self, beta: f32) -> Self {
         self.builder.apply(GraphIROp::LinearCombination(alpha, self.node, beta, rhs.node))
     }
 
+    pub fn reduce_sum_across_batch(self) -> Self {
+        self.builder.apply(GraphIROp::ReduceAcrossBatch(self.node, Reduce::Sum))
+    }
+
+    pub fn reduce_avg_across_batch(self) -> Self {
+        self.builder.apply(GraphIROp::ReduceAcrossBatch(self.node, Reduce::Avg))
+    }
+
     pub fn matmul(self, rhs: Self) -> Self {
         if self.builder.builder().get(rhs.node.idx).unwrap().sparse.is_some() {
-            self.builder.apply(GraphIROp::SparseAffineActivate(self.node, rhs.node, None, DiffableFromOutput::Identity))
+            self.builder.apply(GraphIROp::SparseAffineActivate(
+                self.node,
+                rhs.node,
+                None,
+                None,
+                DiffableFromOutput::Identity,
+            ))
         } else {
             self.builder.apply(GraphIROp::Matmul(self.node, false, rhs.node, false))
         }
@@ -331,6 +386,14 @@ impl<'a> Affine<'a> {
         self.weights.matmul(input) + self.bias
     }
 
+    pub fn init_with_effective_input_size(&self, size: usize) {
+        let builder = self.weights.builder.builder();
+        let w = builder.get(self.weights.node.idx).unwrap();
+        let id = w.id.clone().unwrap();
+        *self.weights.builder.init().get_mut(&id).unwrap() =
+            InitSettings::Normal { mean: 0.0, stdev: (2.0 / size as f32).sqrt() };
+    }
+
     pub fn forward_sparse_dual_with_activation(
         self,
         stm: GraphBuilderNode<'a>,
@@ -338,5 +401,19 @@ impl<'a> Affine<'a> {
         activation: Activation,
     ) -> GraphBuilderNode<'a> {
         self.forward(stm).concat(self.forward(ntm)).activate(activation)
+    }
+
+    pub fn forward_sparse_with_values(
+        self,
+        stm: GraphBuilderNode<'a>,
+        vals: GraphBuilderNode<'a>,
+    ) -> GraphBuilderNode<'a> {
+        stm.builder.apply(GraphIROp::SparseAffineActivate(
+            self.weights.node,
+            stm.node,
+            Some(vals.node),
+            Some(self.bias.node),
+            DiffableFromOutput::Identity,
+        ))
     }
 }

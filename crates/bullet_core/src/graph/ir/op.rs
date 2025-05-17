@@ -15,16 +15,23 @@ pub enum DiffableFromOutput {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GraphIROp {
     Affine(AnnotatedNode, AnnotatedNode, AnnotatedNode),
-    SparseAffineActivate(AnnotatedNode, AnnotatedNode, Option<AnnotatedNode>, DiffableFromOutput),
-    SparseAffineDualActivate(AnnotatedNode, AnnotatedNode, AnnotatedNode, AnnotatedNode, DiffableFromOutput),
+    SparseAffineActivate(
+        AnnotatedNode,
+        AnnotatedNode,
+        Option<AnnotatedNode>,
+        Option<AnnotatedNode>,
+        DiffableFromOutput,
+    ),
+    SparseAffineDualActivate(AnnotatedNode, AnnotatedNode, AnnotatedNode, Option<AnnotatedNode>, DiffableFromOutput),
     Concat(AnnotatedNode, AnnotatedNode),
+    Copy(AnnotatedNode, bool),
     Gather(AnnotatedNode, AnnotatedNode),
     LinearCombination(f32, AnnotatedNode, f32, AnnotatedNode),
     Mask(AnnotatedNode, AnnotatedNode),
     Matmul(AnnotatedNode, bool, AnnotatedNode, bool),
     PairwiseMul(AnnotatedNode, bool),
     PowerError(AnnotatedNode, AnnotatedNode, f32),
-    ReduceAcrossBatch(AnnotatedNode),
+    ReduceAcrossBatch(AnnotatedNode, Reduce),
     Select(AnnotatedNode, AnnotatedNode),
     Slice(AnnotatedNode, usize, usize),
     ToDense(AnnotatedNode),
@@ -39,6 +46,12 @@ pub enum UnaryOp {
     Add(f32),
     Mul(f32),
     AbsPow(f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Reduce {
+    Sum,
+    Avg,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -63,6 +76,7 @@ pub enum GraphIROpErrorType {
     InvalidMatmulDims,
     AnnotatedNodeWithIdAlreadyExists,
     MismatchedBatching,
+    GradientNotSupported,
 }
 
 impl GraphIROp {
@@ -79,17 +93,19 @@ impl GraphIROp {
             ty: MismatchedInputShapes(nodes.iter().map(|&x| x.shape).collect::<Vec<_>>()),
         };
 
+        let err = |ty| GraphIROpError::new(self, ty);
+
         let check_dense_eq = |node: &AnnotatedNode, dense: bool| {
             if get(node).sparse.is_none() == dense {
                 Ok(())
             } else {
-                Err(GraphIROpError::new(self, GraphIROpErrorType::IncorrectDataLayout))
+                Err(err(GraphIROpErrorType::IncorrectDataLayout))
             }
         };
 
         let check_not_batched = |node: &AnnotatedNode| {
             if get(node).batched {
-                Err(GraphIROpError::new(self, GraphIROpErrorType::BatchedInputNotSupported))
+                Err(err(GraphIROpErrorType::BatchedInputNotSupported))
             } else {
                 Ok(())
             }
@@ -99,7 +115,7 @@ impl GraphIROp {
             if let Some(c) = a.matmul(b) {
                 Ok(c)
             } else {
-                Err(GraphIROpError::new(self, GraphIROpErrorType::InvalidMatmulDims))
+                Err(err(GraphIROpErrorType::InvalidMatmulDims))
             }
         };
 
@@ -107,20 +123,28 @@ impl GraphIROp {
             if x.iter().all(|y| get(y).batched == get(x[0]).batched) {
                 Ok(())
             } else {
-                Err(GraphIROpError::new(self, GraphIROpErrorType::MismatchedBatching))
+                Err(err(GraphIROpErrorType::MismatchedBatching))
+            }
+        };
+
+        let check_no_grad = |x: &[&AnnotatedNode]| {
+            if x.iter().any(|y| get(y).requires_grad) {
+                Err(err(GraphIROpErrorType::GradientNotSupported))
+            } else {
+                Ok(())
             }
         };
 
         for node in self.nodes() {
             if node.shape.size() != get(&node).shape.size() {
-                let err = GraphIROpError::new(self, GraphIROpErrorType::InvalidInputShape(node.shape));
+                let err = err(GraphIROpErrorType::InvalidInputShape(node.shape));
                 return Err(GraphIRError::Op(err));
             }
         }
 
         let mut batched = self.nodes().iter().any(|node| get(node).batched);
 
-        let requires_grad = self.nodes().iter().any(|node| get(node).requires_grad);
+        let mut requires_grad = self.nodes().iter().any(|node| get(node).requires_grad);
 
         let shape = match self {
             Affine(w, i, b) => {
@@ -130,8 +154,11 @@ impl GraphIROp {
                 check_not_batched(w)?;
                 check_not_batched(b)?;
 
-                let out = check_matmul(w.shape, i.shape)?;
-                ret(out == b.shape, out, mismatch(&[w, i]))
+                // N.B:
+                // y = A.matmul(x).reshape(b.shape) + b -> mm_shape != b.shape
+                // y = A.matmul(x) + b2.reshape(mm_shape) -> mm_shape == b.shape
+                let mm_shape = check_matmul(w.shape, i.shape)?;
+                ret(mm_shape.size() == b.shape.size(), b.shape, mismatch(&[w, i]))
             }
             Concat(a, b) => {
                 check_dense_eq(a, true)?;
@@ -145,9 +172,19 @@ impl GraphIROp {
                 let out = Shape::new(a.shape.rows() + b.shape.rows(), a.shape.cols());
                 ret(a.shape.cols() == b.shape.cols(), out, mismatch(&[a, b]))
             }
+            Copy(node, stop_grad) => {
+                check_dense_eq(node, true)?;
+
+                if *stop_grad {
+                    requires_grad = false;
+                }
+
+                Ok(node.shape)
+            }
             Gather(input, mask) => {
                 check_dense_eq(input, true)?;
                 check_dense_eq(mask, false)?;
+                check_no_grad(&[mask])?;
 
                 let valid = input.shape.cols() == 1 && mask.shape.cols() == 1;
                 ret(valid, mask.shape, mismatch(&[input, mask]))
@@ -161,6 +198,7 @@ impl GraphIROp {
             Mask(input, mask) => {
                 check_dense_eq(input, true)?;
                 check_dense_eq(mask, false)?;
+                check_no_grad(&[mask])?;
 
                 ret(input.shape == mask.shape, input.shape, mismatch(&[input, mask]))
             }
@@ -184,11 +222,10 @@ impl GraphIROp {
                 check_same_batching(&[a, b])?;
                 ret(a.shape == b.shape, a.shape, mismatch(&[a, b]))
             }
-            ReduceAcrossBatch(node) => {
+            ReduceAcrossBatch(node, _) => {
                 check_dense_eq(node, true)?;
-                let is = node.shape;
                 batched = false;
-                ret(is == Shape::new(1, 1), is, GraphIROpError::new(self, InvalidInputShape(is)))
+                Ok(node.shape)
             }
             Select(input, buckets) => {
                 check_dense_eq(input, true)?;
@@ -207,30 +244,47 @@ impl GraphIROp {
                 let out = Shape::new(end - start, 1);
                 ret(valid, out, GraphIROpError::new(self, OutOfBounds(is, [*start, *end])))
             }
-            SparseAffineActivate(w, i, b, _) => {
+            SparseAffineActivate(w, i, v, b, _) => {
                 check_dense_eq(w, true)?;
                 check_dense_eq(i, false)?;
                 check_not_batched(w)?;
+                check_no_grad(&[i])?;
 
                 if let Some(b) = b {
                     check_dense_eq(b, true)?;
                 }
 
                 let out = check_matmul(w.shape, i.shape)?;
-                ret(b.is_none() || out == b.unwrap().shape, out, mismatch(&[w, i]))
+                let mut check = b.is_none() || out == b.unwrap().shape;
+                check &= i.shape.cols() == 1;
+
+                if let Some(v) = v {
+                    check_dense_eq(v, true)?;
+                    check_same_batching(&[i, v])?;
+                    check_no_grad(&[v])?;
+                    let nnz = get(i).sparse.unwrap();
+                    check &= v.shape.cols() == 1 && v.shape.rows() == nnz.get();
+                }
+
+                ret(check, out, mismatch(&[w, i]))
             }
             SparseAffineDualActivate(w, s, n, b, _) => {
                 check_dense_eq(w, true)?;
-                check_dense_eq(b, true)?;
                 check_dense_eq(s, false)?;
                 check_dense_eq(n, false)?;
                 check_not_batched(w)?;
                 check_same_batching(&[s, n])?;
-                let shb = b.shape;
+                check_no_grad(&[s, n])?;
 
                 let out = check_matmul(w.shape, s.shape)?;
-                let valid = s.shape == n.shape && out == shb;
-                ret(valid, Shape::new(2 * shb.rows(), shb.cols()), mismatch(&[w, s, n, b]))
+                let mut valid = s.shape == n.shape;
+
+                if let Some(b) = b {
+                    check_dense_eq(b, true)?;
+                    valid &= out == b.shape
+                }
+
+                ret(valid, Shape::new(2 * out.rows(), out.cols()), mismatch(&[w, s, n]))
             }
             ToDense(node) => {
                 check_dense_eq(node, false)?;
@@ -243,6 +297,8 @@ impl GraphIROp {
             MaskedSoftmaxCrossEntropyLoss(mask, input, target) => {
                 check_dense_eq(input, true)?;
                 check_dense_eq(target, true)?;
+                check_dense_eq(mask, false)?;
+                check_no_grad(&[mask, target])?;
                 let is = input.shape;
                 let valid = get(mask).sparse.unwrap().get() == target.shape.rows()
                     && mask.shape == is
@@ -266,25 +322,38 @@ impl GraphIROp {
         match *self {
             Affine(a, b, c) => vec![a, b, c],
             Concat(a, b) => vec![a, b],
+            Copy(node, _) => vec![node],
             Gather(input, mask) => vec![input, mask],
             LinearCombination(_, a, _, b) => vec![a, b],
             Mask(input, mask) => vec![input, mask],
             Matmul(a, _, b, _) => vec![a, b],
             PairwiseMul(input, _) => vec![input],
             PowerError(a, b, _) => vec![a, b],
-            ReduceAcrossBatch(node) => vec![node],
+            ReduceAcrossBatch(node, _) => vec![node],
             Select(input, buckets) => vec![input, buckets],
             Slice(input, _, _) => vec![input],
-            SparseAffineActivate(w, i, b, _) => {
-                if let Some(b) = b {
-                    vec![w, i, b]
-                } else {
-                    vec![w, i]
+            SparseAffineActivate(w, i, v, b, _) => {
+                let mut nodes = vec![w, i];
+
+                if let Some(v) = v {
+                    nodes.push(v);
                 }
+
+                if let Some(b) = b {
+                    nodes.push(b);
+                }
+
+                nodes
             }
             ToDense(node) => vec![node],
             Unary(node, _) => vec![node],
-            SparseAffineDualActivate(w, s, n, b, _) => vec![w, s, n, b],
+            SparseAffineDualActivate(w, s, n, b, _) => {
+                if let Some(b) = b {
+                    vec![w, s, n, b]
+                } else {
+                    vec![w, s, n]
+                }
+            }
             MaskedSoftmaxCrossEntropyLoss(mask, input, target) => vec![mask, input, target],
             SoftmaxCrossEntropyLoss(a, b) => vec![a, b],
         }

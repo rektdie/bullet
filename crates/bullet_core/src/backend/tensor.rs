@@ -11,7 +11,7 @@ pub use sparse::SparseMatrix;
 
 use crate::{
     backend::device::{Device, DeviceBuffer, OperationError},
-    graph::ir::op::GraphIROp,
+    graph::ir::{op::GraphIROp, shape::Shape},
 };
 
 pub struct Tensor<D: Device> {
@@ -20,17 +20,20 @@ pub struct Tensor<D: Device> {
     pub(crate) internal: HashMap<String, RefCell<DenseMatrix<D>>>,
     pub(crate) operation: Option<GraphIROp>,
     pub(crate) idx: usize,
+    shape: Shape,
 }
 
 impl<D: Device> Tensor<D> {
     pub fn new(
         device: Arc<D>,
-        single_size: usize,
+        shape: Shape,
         requires_grad: bool,
         operation: Option<GraphIROp>,
         sparse: Option<NonZeroUsize>,
         idx: usize,
     ) -> Result<Self, D::DeviceError> {
+        let single_size = shape.size();
+
         let values = if let Some(nnz) = sparse.map(usize::from) {
             Matrix::Sparse(SparseMatrix::zeroed(device.clone(), single_size, nnz)?)
         } else {
@@ -43,6 +46,7 @@ impl<D: Device> Tensor<D> {
             internal: HashMap::new(),
             operation,
             idx,
+            shape,
         })
     }
 
@@ -52,6 +56,10 @@ impl<D: Device> Tensor<D> {
         }
 
         Ok(())
+    }
+
+    pub fn shape(&self) -> Shape {
+        self.shape
     }
 
     pub fn get_scalar(&self) -> Option<f32> {
@@ -92,18 +100,14 @@ impl<D: Device> Tensor<D> {
         grad.load_from_slice(None, &[1.0])
     }
 
-    pub fn load_from_slice(&mut self, batch_size: Option<usize>, values: &[f32]) -> Result<(), D::DeviceError> {
-        if let Matrix::Dense(dst) = &mut self.values {
-            assert_eq!(values.len(), dst.size());
-            dst.load_from_slice(batch_size, values)
-        } else {
-            panic!("This tensor is sparse!")
-        }
-    }
-
-    pub fn seed_random(&mut self, mean: f32, stdev: f32, use_gaussian: bool) -> Result<(), D::DeviceError> {
+    pub fn seed_random(
+        &mut self,
+        mean: f32,
+        stdev: f32,
+        use_gaussian: bool,
+    ) -> Result<(), OperationError<D::DeviceError>> {
         let values = rng::vec_f32(self.values.size(), mean, stdev, use_gaussian);
-        self.load_from_slice(self.values.batch_size(), &values)
+        self.load_dense_from_slice(self.values.batch_size(), &values)
     }
 
     pub fn load_dense_from_slice(

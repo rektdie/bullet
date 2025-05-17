@@ -125,21 +125,33 @@ fn op_args(
         Some(op) => match op {
             Affine(a, b, c) => format!("{}, {}, {}", id(a), id(b), id(c)),
             Concat(a, b) => format!("{}, {}", id(a), id(b)),
+            Copy(node, stop_grad) => format!("{}, {stop_grad}", id(node)),
             Gather(input, mask) => format!("{}, {}", id(input), id(mask)),
             LinearCombination(alpha, a, beta, b) => format!("{}, {}, {}, {}", fp(alpha), id(a), fp(beta), id(b)),
             Mask(input, mask) => format!("{}, {}", id(input), id(mask)),
             Matmul(a, ta, b, tb) => format!("{}, {ta}, {}, {tb}", id(a), id(b)),
             PairwiseMul(input, post_concat) => format!("{}, {post_concat}", id(input)),
             PowerError(a, b, pow) => format!("{}, {}, {pow}", id(a), id(b)),
-            ReduceAcrossBatch(node) => id(node),
+            ReduceAcrossBatch(node, reduce) => format!("{}, {reduce:?}", id(node)),
             Select(input, buckets) => format!("{}, {}", id(input), id(buckets)),
             Slice(input, a, b) => format!("{}, {a}, {b}", id(input)),
-            SparseAffineActivate(w, i, b, act) => match (b, act) {
-                (Some(b), DiffableFromOutput::Identity) => format!("{}, {}, {}", id(w), id(i), id(b)),
-                (Some(b), _) => format!("{}, {}, {}, {act:?}", id(w), id(i), id(b)),
-                (None, DiffableFromOutput::Identity) => format!("{}, {}", id(w), id(i)),
-                (None, _) => format!("{}, {}, {act:?}", id(w), id(i)),
-            },
+            SparseAffineActivate(w, i, v, b, act) => {
+                let mut base = format!("{}, {}", id(w), id(i));
+
+                if let Some(v) = v {
+                    base = format!("{base}, {}", id(v));
+                }
+
+                if let Some(b) = b {
+                    base = format!("{base}, {}", id(b));
+                }
+
+                if *act != DiffableFromOutput::Identity {
+                    base = format!("{base}, {act:?}");
+                }
+
+                base
+            }
             ToDense(node) => id(node),
             Unary(node, unary) => match unary {
                 UnaryOp::DiffableFromOutput(_) => id(node),
@@ -147,9 +159,12 @@ fn op_args(
                 UnaryOp::Mul(x) => format!("{}, {}", id(node), fp(x)),
                 UnaryOp::AbsPow(x) => format!("{}, {}", id(node), fp(x)),
             },
-            SparseAffineDualActivate(w, s, n, b, act) => {
-                format!("{}, {}, {}, {}, {act:?}", id(w), id(s), id(n), id(b))
-            }
+            SparseAffineDualActivate(w, s, n, b, act) => match (b, act) {
+                (Some(b), DiffableFromOutput::Identity) => format!("{}, {}, {}, {}", id(w), id(s), id(n), id(b)),
+                (Some(b), _) => format!("{}, {}, {}, {}, {act:?}", id(w), id(s), id(n), id(b)),
+                (None, DiffableFromOutput::Identity) => format!("{}, {}, {}", id(w), id(s), id(n)),
+                (None, _) => format!("{}, {}, {}, {act:?}", id(w), id(s), id(n)),
+            },
             MaskedSoftmaxCrossEntropyLoss(mask, input, target) => {
                 format!("{}, {}, {}", id(mask), id(input), id(target))
             }
@@ -170,11 +185,18 @@ fn op_name(node: &GraphIRNode) -> String {
 
     match node.parent_operation.as_ref() {
         Some(op) => match op {
-            SparseAffineActivate(_, _, b, act) => match (b, act) {
+            SparseAffineActivate(_, _, _, b, act) => match (b, act) {
                 (Some(_), DiffableFromOutput::Identity) => "SparseAffine",
                 (Some(_), _) => "SparseAffineActivate",
                 (None, DiffableFromOutput::Identity) => "SparseMatmul",
                 (None, _) => "SparseMatmulActivate",
+            }
+            .to_string(),
+            SparseAffineDualActivate(_, _, _, b, act) => match (b, act) {
+                (Some(_), DiffableFromOutput::Identity) => "SparseAffineDual",
+                (Some(_), _) => "SparseAffineDualActivate",
+                (None, DiffableFromOutput::Identity) => "SparseMatmulDual",
+                (None, _) => "SparseMatmulDualActivate",
             }
             .to_string(),
             Unary(_, unary) => match unary {
