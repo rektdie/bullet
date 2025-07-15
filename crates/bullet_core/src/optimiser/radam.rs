@@ -5,12 +5,12 @@ use std::{
     sync::Arc,
 };
 
-use crate::backend::{
+use crate::{
     device::{
         base::{AdamConfig, BaseOperations},
         Device, OperationError,
     },
-    tensor::DenseMatrix,
+    graph::tensor::DenseMatrix,
 };
 
 use super::{utils, OptimiserState};
@@ -20,11 +20,13 @@ pub struct RAdamParams {
     pub beta1: f32,
     pub beta2: f32,
     pub n_sma_threshold: f32,
+    pub decay: f32,
+    pub clip: Option<(f32, f32)>,
 }
 
 impl Default for RAdamParams {
     fn default() -> Self {
-        Self { beta1: 0.9, beta2: 0.999, n_sma_threshold: 5.0 }
+        Self { beta1: 0.9, beta2: 0.999, n_sma_threshold: 5.0, decay: 0.0, clip: None }
     }
 }
 
@@ -79,14 +81,16 @@ impl<D: Device> OptimiserState<D> for RAdam<D> {
             1.0 / denom
         };
 
+        let lr = learning_rate * step_size;
+
         let cfg = AdamConfig {
             beta1: self.params.beta1,
             beta2: self.params.beta2,
             gradient_factor,
-            learning_rate: learning_rate * step_size,
+            learning_rate: lr,
             denom: n_sma > params.n_sma_threshold,
-            clip: None,
-            decay: 1.0,
+            clip: self.params.clip,
+            decay: 1.0 - self.params.decay * lr,
         };
 
         weights.buf.adam(&cfg, weights.size(), &grads.buf, &mut self.momentum.buf, &mut self.velocity.buf)?;
@@ -96,8 +100,8 @@ impl<D: Device> OptimiserState<D> for RAdam<D> {
 
     fn reset(&mut self) -> Result<(), D::DeviceError> {
         self.step = 0;
-        self.momentum.set_zero()?;
-        self.velocity.set_zero()
+        self.momentum.set_to(0.0)?;
+        self.velocity.set_to(0.0)
     }
 
     fn write_to_checkpoint(map: &HashMap<String, &Self>, path: &str) -> Result<(), D::DeviceError> {
